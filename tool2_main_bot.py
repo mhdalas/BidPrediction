@@ -417,7 +417,6 @@ def parse_sheet(raw_csv: str) -> list[AuctionColumn]:
     return auctions
 
 
-# __APPEND_HERE__
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None or update.message is None:
@@ -833,7 +832,9 @@ def build_application() -> object:
     app.add_handler(CommandHandler("buy", buy_command))
     app.add_handler(CommandHandler("grant", grant_command))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(MessageHandler(filters.StatusUpdate.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    # Compatibility across python-telegram-bot versions:
+    # some versions do not expose StatusUpdate.SUCCESSFUL_PAYMENT.
+    app.add_handler(MessageHandler(filters.ALL, successful_payment_handler), group=1)
     app.add_handler(conversation)
     return app
 
@@ -843,8 +844,6 @@ def main() -> None:
     application.run_polling()
 
 
-if __name__ == "__main__":
-    main()
 def fit_dist(bids: list[float]) -> dict[str, float]:
     values = sorted(bids)
     q1 = percentile(values, 25)
@@ -1207,4 +1206,5 @@ def format_amount(amount: int) -> str:
     return f"{amount / 100:.2f} {PAYMENT_CURRENCY}"
 
 
-# __APPEND_HERE__
+if __name__ == "__main__":
+    main()
