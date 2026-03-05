@@ -6,6 +6,7 @@ import io
 import math
 import os
 import random
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -13,13 +14,14 @@ from typing import Iterable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-from telegram import Update
+from telegram import LabeledPrice, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -34,7 +36,188 @@ DEFAULT_CAP_NEG = -15.0
 DEFAULT_M = 1
 DEFAULT_MC = 8000
 
+RUN_COST_CREDITS = int(os.getenv("RUN_COST_CREDITS", "1"))
+ADMIN_START_BONUS = int(os.getenv("ADMIN_START_BONUS", "10"))
+
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "").strip()
+PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "USD").strip().upper()
+CREDITS_DB_PATH = os.getenv("CREDITS_DB_PATH", "credits.sqlite3")
+
+BUY_PACKAGES: dict[str, dict[str, int]] = {
+    "mini": {"credits": 5, "amount": 199, "hours": 72},
+    "standard": {"credits": 20, "amount": 599, "hours": 720},
+    "pro": {"credits": 50, "amount": 1299, "hours": 2160},
+}
+
 OCE, N_VALUE, KAPPA, CAP_NEG, M_VALUE, MC_VALUE = range(6)
+
+
+def parse_owner_ids() -> set[int]:
+    result: set[int] = set()
+    single = os.getenv("OWNER_ID", "").strip()
+    raw_multi = os.getenv("OWNER_IDS", "").strip()
+
+    if single:
+        try:
+            result.add(int(single))
+        except ValueError:
+            pass
+
+    if raw_multi:
+        for token in raw_multi.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                result.add(int(token))
+            except ValueError:
+                pass
+    return result
+
+
+OWNER_IDS = parse_owner_ids()
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id in OWNER_IDS
+
+
+class CreditStore:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS credit_lots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    remaining INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    source TEXT NOT NULL,
+                    note TEXT,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_records (
+                    telegram_payment_charge_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+
+    def add_credits(
+        self,
+        user_id: int,
+        credits: int,
+        hours: int | None,
+        source: str,
+        note: str = "",
+    ) -> None:
+        if credits <= 0:
+            return
+        now = int(time.time())
+        expires_at = None
+        if hours is not None and hours > 0:
+            expires_at = now + (hours * 3600)
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO credit_lots(user_id, remaining, expires_at, source, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, credits, expires_at, source, note, now),
+            )
+
+    def balance(self, user_id: int) -> int:
+        now = int(time.time())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(remaining), 0) AS total
+                FROM credit_lots
+                WHERE user_id = ?
+                  AND remaining > 0
+                  AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (user_id, now),
+            ).fetchone()
+        return int(row["total"] if row else 0)
+
+    def consume(self, user_id: int, amount: int) -> bool:
+        if amount <= 0:
+            return True
+
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, remaining
+                FROM credit_lots
+                WHERE user_id = ?
+                  AND remaining > 0
+                  AND (expires_at IS NULL OR expires_at > ?)
+                ORDER BY
+                  CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END,
+                  expires_at,
+                  id
+                """,
+                (user_id, now),
+            ).fetchall()
+
+            total = sum(int(row["remaining"]) for row in rows)
+            if total < amount:
+                conn.rollback()
+                return False
+
+            left = amount
+            for row in rows:
+                if left <= 0:
+                    break
+                lot_id = int(row["id"])
+                available = int(row["remaining"])
+                take = min(left, available)
+                conn.execute(
+                    "UPDATE credit_lots SET remaining = remaining - ? WHERE id = ?",
+                    (take, lot_id),
+                )
+                left -= take
+
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def register_payment(self, charge_id: str, user_id: int, payload: str) -> bool:
+        now = int(time.time())
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO payment_records
+                (telegram_payment_charge_id, user_id, payload, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (charge_id, user_id, payload, now),
+            )
+            return cursor.rowcount == 1
+
+
+CREDITS = CreditStore(CREDITS_DB_PATH)
 
 
 @dataclass(frozen=True)
@@ -197,7 +380,6 @@ def parse_sheet(raw_csv: str) -> list[AuctionColumn]:
     if oce_index < 0:
         oce_index = 1
 
-    header_row = rows[max(0, oce_index - 1)]
     oce_row = rows[oce_index]
     bid_rows = rows[oce_index + 1 :]
 
@@ -206,7 +388,6 @@ def parse_sheet(raw_csv: str) -> list[AuctionColumn]:
         oce_raw = oce_row[col].replace(",", "").strip() if col < len(oce_row) else ""
         if not oce_raw:
             continue
-
         try:
             oce = float(oce_raw)
         except ValueError:
@@ -214,7 +395,6 @@ def parse_sheet(raw_csv: str) -> list[AuctionColumn]:
         if not math.isfinite(oce) or oce <= 0:
             continue
 
-        _column_id = header_row[col].strip() if col < len(header_row) else str(col)
         bids: list[float] = []
         for row in bid_rows:
             if col >= len(row):
@@ -229,17 +409,442 @@ def parse_sheet(raw_csv: str) -> list[AuctionColumn]:
             if math.isfinite(value):
                 bids.append(value)
 
-        if len(bids) < 2:
-            continue
-
-        auctions.append(AuctionColumn(oce=oce, bids=tuple(sorted(bids))))
+        if len(bids) >= 2:
+            auctions.append(AuctionColumn(oce=oce, bids=tuple(sorted(bids))))
 
     if not auctions:
         raise ValueError("No valid auction columns found.")
-
     return auctions
 
 
+# __APPEND_HERE__
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None or update.message is None:
+        return
+
+    if is_owner(user.id) and ADMIN_START_BONUS > 0:
+        CREDITS.add_credits(
+            user_id=user.id,
+            credits=ADMIN_START_BONUS,
+            hours=None,
+            source="owner_start_bonus",
+            note="Auto bonus on /start",
+        )
+
+    balance = CREDITS.balance(user.id)
+    await update.message.reply_text(
+        "Commands:\n"
+        "/run - start solver (costs 1 credit)\n"
+        "/credit - check your credits\n"
+        "/buy - see credit packages\n"
+        "/cancel - stop current run\n\n"
+        f"Current credits: {balance}"
+    )
+
+
+async def credit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None or update.message is None:
+        return
+    balance = CREDITS.balance(user.id)
+    await update.message.reply_text(
+        f"Credits: {balance}\nEach /run consumes {RUN_COST_CREDITS} credit."
+    )
+
+
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+
+    if not PAYMENT_PROVIDER_TOKEN:
+        await update.message.reply_text(
+            "Payments are not configured yet. Set PAYMENT_PROVIDER_TOKEN in Railway."
+        )
+        return
+
+    if not context.args:
+        lines = ["Available packages:"]
+        for key, pkg in BUY_PACKAGES.items():
+            lines.append(
+                f"- /buy {key} -> {pkg['credits']} credits, valid {pkg['hours']}h, {format_amount(pkg['amount'])}"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    package_key = context.args[0].strip().lower()
+    package = BUY_PACKAGES.get(package_key)
+    if package is None:
+        await update.message.reply_text("Unknown package. Use /buy to list packages.")
+        return
+
+    credits = int(package["credits"])
+    hours = int(package["hours"])
+    amount = int(package["amount"])
+    payload = f"credit_pack:{package_key}:{credits}:{hours}"
+
+    await update.message.reply_invoice(
+        title=f"{credits} bot credits",
+        description=f"Get {credits} credits (valid {hours} hours).",
+        payload=payload,
+        provider_token=PAYMENT_PROVIDER_TOKEN,
+        currency=PAYMENT_CURRENCY,
+        prices=[LabeledPrice(label=f"{credits} credits", amount=amount)],
+        start_parameter=f"credits-{package_key}",
+    )
+
+
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    if query is None:
+        return
+    if parse_buy_payload(query.invoice_payload) is None:
+        await query.answer(ok=False, error_message="Invalid purchase payload.")
+        return
+    await query.answer(ok=True)
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+    payment = update.message.successful_payment
+    if payment is None:
+        return
+
+    parsed = parse_buy_payload(payment.invoice_payload)
+    if parsed is None:
+        await update.message.reply_text("Payment received, but payload is invalid.")
+        return
+
+    package_id, credits, hours = parsed
+    user_id = update.effective_user.id
+    charge_id = payment.telegram_payment_charge_id
+    is_new = CREDITS.register_payment(charge_id, user_id, payment.invoice_payload)
+
+    if is_new:
+        CREDITS.add_credits(
+            user_id=user_id,
+            credits=credits,
+            hours=hours,
+            source=f"purchase:{package_id}",
+            note=f"provider_charge_id={charge_id}",
+        )
+
+    balance = CREDITS.balance(user_id)
+    await update.message.reply_text(
+        f"Payment successful. Added {credits} credits (valid {hours}h).\n"
+        f"Current credits: {balance}"
+    )
+
+
+async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+
+    owner_id = update.effective_user.id
+    if not is_owner(owner_id):
+        await update.message.reply_text("Only owner can use /grant.")
+        return
+
+    if len(context.args) != 3:
+        await update.message.reply_text(
+            "Usage: /grant <user_id> <credits> <hours>\nExample: /grant 123456789 20 48"
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        credits = int(context.args[1])
+        hours = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("user_id, credits and hours must be integers.")
+        return
+
+    if credits <= 0:
+        await update.message.reply_text("credits must be > 0.")
+        return
+    if hours <= 0:
+        await update.message.reply_text("hours must be > 0.")
+        return
+
+    CREDITS.add_credits(
+        user_id=target_user_id,
+        credits=credits,
+        hours=hours,
+        source=f"owner_grant:{owner_id}",
+        note="manual grant",
+    )
+    target_balance = CREDITS.balance(target_user_id)
+
+    await update.message.reply_text(
+        f"Granted {credits} credits for {hours}h to user {target_user_id}.\n"
+        f"User balance: {target_balance}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"You received {credits} credits valid for {hours} hours.",
+        )
+    except Exception:
+        pass
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    clear_session(context)
+    if update.message:
+        await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or update.effective_user is None:
+        return ConversationHandler.END
+
+    clear_session(context)
+    session = get_session(context)
+    user_id = update.effective_user.id
+    balance = CREDITS.balance(user_id)
+    if balance < RUN_COST_CREDITS:
+        await update.message.reply_text(
+            f"You need at least {RUN_COST_CREDITS} credit to run.\n"
+            "Use /buy to purchase credits."
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text("Fetching sheet data and training model...")
+    try:
+        model = await asyncio.to_thread(load_model_from_sheet, DEFAULT_SHEET_URL)
+    except Exception as exc:
+        clear_session(context)
+        await update.message.reply_text(f"Could not load the sheet: {exc}")
+        return ConversationHandler.END
+
+    session["model"] = model
+    await update.message.reply_text(
+        f"Model ready from {model.auctions} auctions and {model.total_bids} bids.\n"
+        "Enter Official Cost Estimate (OCE)."
+    )
+    return OCE
+
+
+async def oce_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None:
+        return OCE
+    text = update.message.text.strip()
+    try:
+        oce = float(text)
+    except ValueError:
+        await update.message.reply_text("Enter a numeric OCE greater than 0.")
+        return OCE
+    if not math.isfinite(oce) or oce <= 0:
+        await update.message.reply_text("Enter a numeric OCE greater than 0.")
+        return OCE
+
+    session = get_session(context)
+    session["oce"] = oce
+    await update.message.reply_text(
+        "Enter number of bidders n (1-200), or type auto to predict it from OCE."
+    )
+    return N_VALUE
+
+
+async def n_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None:
+        return N_VALUE
+    text = update.message.text.strip().lower()
+    session = get_session(context)
+
+    if text in {"auto", "a"}:
+        session["n_value"] = None
+    else:
+        try:
+            n_value = int(text)
+        except ValueError:
+            await update.message.reply_text("Enter an integer from 1 to 200, or type auto.")
+            return N_VALUE
+        if n_value < 1 or n_value > 200:
+            await update.message.reply_text("Enter an integer from 1 to 200, or type auto.")
+            return N_VALUE
+        session["n_value"] = n_value
+
+    await update.message.reply_text(
+        f"Enter NPPI coefficient kappa (0.700-1.000). Type default for {DEFAULT_KAPPA:.3f}."
+    )
+    return KAPPA
+
+
+async def kappa_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None:
+        return KAPPA
+    text = update.message.text.strip()
+    if is_default(text):
+        kappa = DEFAULT_KAPPA
+    else:
+        try:
+            kappa = float(text)
+        except ValueError:
+            await update.message.reply_text("Enter a number between 0.700 and 1.000.")
+            return KAPPA
+    if not math.isfinite(kappa) or not (0.7 <= kappa <= 1.0):
+        await update.message.reply_text("Enter a number between 0.700 and 1.000.")
+        return KAPPA
+
+    session = get_session(context)
+    session["kappa"] = kappa
+    await update.message.reply_text(
+        f"Enter lower cap percent vs OCE (-40 to 5). Type default for {DEFAULT_CAP_NEG:.0f}."
+    )
+    return CAP_NEG
+
+
+async def cap_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None:
+        return CAP_NEG
+    text = update.message.text.strip()
+    if is_default(text):
+        cap_neg = DEFAULT_CAP_NEG
+    else:
+        try:
+            cap_neg = float(text)
+        except ValueError:
+            await update.message.reply_text("Enter a number from -40 to 5.")
+            return CAP_NEG
+    if not math.isfinite(cap_neg) or not (-40.0 <= cap_neg <= 5.0):
+        await update.message.reply_text("Enter a number from -40 to 5.")
+        return CAP_NEG
+
+    session = get_session(context)
+    session["cap_neg"] = cap_neg
+    await update.message.reply_text(
+        f"Enter number of my bids m (1-6). Type default for {DEFAULT_M}."
+    )
+    return M_VALUE
+
+
+async def m_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None:
+        return M_VALUE
+    text = update.message.text.strip()
+    if is_default(text):
+        m_value = DEFAULT_M
+    else:
+        try:
+            m_value = int(text)
+        except ValueError:
+            await update.message.reply_text("Enter an integer from 1 to 6.")
+            return M_VALUE
+    if m_value < 1 or m_value > 6:
+        await update.message.reply_text("Enter an integer from 1 to 6.")
+        return M_VALUE
+
+    session = get_session(context)
+    session["m_value"] = m_value
+    await update.message.reply_text(
+        f"Enter Monte Carlo scenarios (500-50000). Type default for {DEFAULT_MC}."
+    )
+    return MC_VALUE
+
+
+async def mc_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or update.effective_user is None:
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    if is_default(text):
+        mc_value = DEFAULT_MC
+    else:
+        try:
+            mc_value = int(text)
+        except ValueError:
+            await update.message.reply_text("Enter an integer from 500 to 50000.")
+            return MC_VALUE
+    if mc_value < 500 or mc_value > 50000:
+        await update.message.reply_text("Enter an integer from 500 to 50000.")
+        return MC_VALUE
+
+    session = get_session(context)
+    model = session.get("model")
+    oce = session.get("oce")
+    if not isinstance(model, TrainedModel) or not isinstance(oce, float):
+        clear_session(context)
+        await update.message.reply_text("Session expired. Run /run again.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("Running optimizer...")
+    try:
+        best_pcts, win_rate = await asyncio.to_thread(
+            solve_best_bid,
+            model,
+            oce,
+            session.get("n_value"),  # type: ignore[arg-type]
+            float(session["kappa"]),
+            float(session["cap_neg"]),
+            int(session["m_value"]),
+            mc_value,
+        )
+    except Exception as exc:
+        clear_session(context)
+        await update.message.reply_text(str(exc))
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    if not CREDITS.consume(user_id, RUN_COST_CREDITS):
+        clear_session(context)
+        await update.message.reply_text(
+            "Not enough credits at finish time. Use /buy then run /run again."
+        )
+        return ConversationHandler.END
+
+    balance = CREDITS.balance(user_id)
+    clear_session(context)
+    bid_lines = [f"B{i + 1}={pct:.2f}%" for i, pct in enumerate(best_pcts)]
+    bid_lines.append(f"Win rate={win_rate:.2f}%")
+    bid_lines.append(f"Credits left: {balance}")
+    await update.message.reply_text(
+        "\n".join(bid_lines)
+    )
+    return ConversationHandler.END
+
+
+def build_application() -> object:
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise SystemExit("Set BOT_TOKEN before running this bot.")
+
+    app = ApplicationBuilder().token(token).build()
+
+    conversation = ConversationHandler(
+        entry_points=[CommandHandler("run", run_command)],
+        states={
+            OCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, oce_step)],
+            N_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, n_step)],
+            KAPPA: [MessageHandler(filters.TEXT & ~filters.COMMAND, kappa_step)],
+            CAP_NEG: [MessageHandler(filters.TEXT & ~filters.COMMAND, cap_step)],
+            M_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_step)],
+            MC_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mc_step)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_command)],
+        allow_reentry=True,
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("credit", credit_command))
+    app.add_handler(CommandHandler("buy", buy_command))
+    app.add_handler(CommandHandler("grant", grant_command))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    app.add_handler(conversation)
+    return app
+
+
+def main() -> None:
+    application = build_application()
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
 def fit_dist(bids: list[float]) -> dict[str, float]:
     values = sorted(bids)
     q1 = percentile(values, 25)
@@ -519,7 +1124,7 @@ def solve_best_bid(
     cap_neg: float,
     m_value: int,
     mc_value: int,
-) -> tuple[float, float]:
+) -> tuple[list[float], float]:
     n = n_value
     if n is None or n < 1:
         n = max(1, round(math.exp(model.oce2n.a + model.oce2n.b * math.log(oce))))
@@ -565,10 +1170,10 @@ def solve_best_bid(
     if float(best["winRate"]) <= 0:
         raise ValueError("No winning bid found. Try lowering the cap.")
 
-    best_b1 = list(best["bids"])[0]  # type: ignore[arg-type]
-    best_pct = ((best_b1 / oce) - 1.0) * 100.0
+    best_bids = list(best["bids"])  # type: ignore[arg-type]
+    best_pcts = [((bid / oce) - 1.0) * 100.0 for bid in best_bids]
     win_rate = float(best["winRate"]) * 100.0
-    return best_pct, win_rate
+    return best_pcts, win_rate
 
 
 def get_session(context: ContextTypes.DEFAULT_TYPE) -> dict[str, object]:
@@ -583,230 +1188,23 @@ def is_default(text: str) -> bool:
     return text.strip().lower() in {"default", "d"}
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Use /run to fetch the sheet, train the model, and enter the inputs step by step.\n"
-        "Use /cancel to stop the current run."
-    )
-
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    clear_session(context)
-    await update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
-
-
-async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    clear_session(context)
-    session = get_session(context)
-    sheet_url = DEFAULT_SHEET_URL
-
-    await update.message.reply_text("Fetching sheet data and training model...")
+def parse_buy_payload(payload: str) -> tuple[str, int, int] | None:
+    parts = payload.split(":")
+    if len(parts) != 4 or parts[0] != "credit_pack":
+        return None
+    package_id = parts[1]
     try:
-        model = await asyncio.to_thread(load_model_from_sheet, sheet_url)
-    except Exception as exc:
-        clear_session(context)
-        await update.message.reply_text(f"Could not load the sheet: {exc}")
-        return ConversationHandler.END
-
-    session["model"] = model
-    await update.message.reply_text(
-        f"Model ready from {model.auctions} auctions and {model.total_bids} bids.\n"
-        "Enter Official Cost Estimate (OCE)."
-    )
-    return OCE
-
-
-async def oce_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    try:
-        oce = float(text)
+        credits = int(parts[2])
+        hours = int(parts[3])
     except ValueError:
-        await update.message.reply_text("Enter a numeric OCE greater than 0.")
-        return OCE
-
-    if not math.isfinite(oce) or oce <= 0:
-        await update.message.reply_text("Enter a numeric OCE greater than 0.")
-        return OCE
-
-    session = get_session(context)
-    session["oce"] = oce
-    await update.message.reply_text(
-        "Enter number of bidders n (1-200), or type auto to predict it from OCE."
-    )
-    return N_VALUE
+        return None
+    if credits <= 0 or hours < 0:
+        return None
+    return package_id, credits, hours
 
 
-async def n_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().lower()
-    session = get_session(context)
-
-    if text in {"auto", "a"}:
-        session["n_value"] = None
-    else:
-        try:
-            n_value = int(text)
-        except ValueError:
-            await update.message.reply_text("Enter an integer from 1 to 200, or type auto.")
-            return N_VALUE
-        if n_value < 1 or n_value > 200:
-            await update.message.reply_text("Enter an integer from 1 to 200, or type auto.")
-            return N_VALUE
-        session["n_value"] = n_value
-
-    await update.message.reply_text(
-        f"Enter NPPI coefficient kappa (0.700-1.000). Type default for {DEFAULT_KAPPA:.3f}."
-    )
-    return KAPPA
+def format_amount(amount: int) -> str:
+    return f"{amount / 100:.2f} {PAYMENT_CURRENCY}"
 
 
-async def kappa_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if is_default(text):
-        kappa = DEFAULT_KAPPA
-    else:
-        try:
-            kappa = float(text)
-        except ValueError:
-            await update.message.reply_text("Enter a number between 0.700 and 1.000.")
-            return KAPPA
-
-    if not math.isfinite(kappa) or not (0.7 <= kappa <= 1.0):
-        await update.message.reply_text("Enter a number between 0.700 and 1.000.")
-        return KAPPA
-
-    session = get_session(context)
-    session["kappa"] = kappa
-    await update.message.reply_text(
-        f"Enter lower cap percent vs OCE (-40 to 5). Type default for {DEFAULT_CAP_NEG:.0f}."
-    )
-    return CAP_NEG
-
-
-async def cap_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if is_default(text):
-        cap_neg = DEFAULT_CAP_NEG
-    else:
-        try:
-            cap_neg = float(text)
-        except ValueError:
-            await update.message.reply_text("Enter a number from -40 to 5.")
-            return CAP_NEG
-
-    if not math.isfinite(cap_neg) or not (-40.0 <= cap_neg <= 5.0):
-        await update.message.reply_text("Enter a number from -40 to 5.")
-        return CAP_NEG
-
-    session = get_session(context)
-    session["cap_neg"] = cap_neg
-    await update.message.reply_text(
-        f"Enter number of my bids m (1-6). Type default for {DEFAULT_M}."
-    )
-    return M_VALUE
-
-
-async def m_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if is_default(text):
-        m_value = DEFAULT_M
-    else:
-        try:
-            m_value = int(text)
-        except ValueError:
-            await update.message.reply_text("Enter an integer from 1 to 6.")
-            return M_VALUE
-
-    if m_value < 1 or m_value > 6:
-        await update.message.reply_text("Enter an integer from 1 to 6.")
-        return M_VALUE
-
-    session = get_session(context)
-    session["m_value"] = m_value
-    await update.message.reply_text(
-        f"Enter Monte Carlo scenarios (500-50000). Type default for {DEFAULT_MC}."
-    )
-    return MC_VALUE
-
-
-async def mc_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if is_default(text):
-        mc_value = DEFAULT_MC
-    else:
-        try:
-            mc_value = int(text)
-        except ValueError:
-            await update.message.reply_text("Enter an integer from 500 to 50000.")
-            return MC_VALUE
-
-    if mc_value < 500 or mc_value > 50000:
-        await update.message.reply_text("Enter an integer from 500 to 50000.")
-        return MC_VALUE
-
-    session = get_session(context)
-    model = session.get("model")
-    oce = session.get("oce")
-    if not isinstance(model, TrainedModel) or not isinstance(oce, float):
-        clear_session(context)
-        await update.message.reply_text("Session expired. Run /run again.")
-        return ConversationHandler.END
-
-    await update.message.reply_text("Running optimizer...")
-    try:
-        best_pct, win_rate = await asyncio.to_thread(
-            solve_best_bid,
-            model,
-            oce,
-            session.get("n_value"),  # type: ignore[arg-type]
-            float(session["kappa"]),
-            float(session["cap_neg"]),
-            int(session["m_value"]),
-            mc_value,
-        )
-    except Exception as exc:
-        clear_session(context)
-        await update.message.reply_text(str(exc))
-        return ConversationHandler.END
-
-    clear_session(context)
-    await update.message.reply_text(
-        f"Best bid B1={best_pct:.2f}%, Win Rate={win_rate:.2f}%"
-    )
-    return ConversationHandler.END
-
-
-def build_application() -> object:
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise SystemExit("Set BOT_TOKEN before running this bot.")
-
-    app = ApplicationBuilder().token(token).build()
-
-    conversation = ConversationHandler(
-        entry_points=[CommandHandler("run", run_command)],
-        states={
-            OCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, oce_step)],
-            N_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, n_step)],
-            KAPPA: [MessageHandler(filters.TEXT & ~filters.COMMAND, kappa_step)],
-            CAP_NEG: [MessageHandler(filters.TEXT & ~filters.COMMAND, cap_step)],
-            M_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_step)],
-            MC_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mc_step)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(conversation)
-    return app
-
-
-def main() -> None:
-    application = build_application()
-    application.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+# __APPEND_HERE__
